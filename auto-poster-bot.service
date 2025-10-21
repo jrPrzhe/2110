@@ -1,0 +1,29 @@
+[Unit]
+Description=Auto-Poster Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/home/botuser/app-inst/auto-poster-bot
+Environment="PATH=/home/botuser/app-inst/auto-poster-bot/venv/bin"
+ExecStart=/home/botuser/app-inst/auto-poster-bot/venv/bin/python main.py
+Restart=always
+RestartSec=10
+
+# Optimization for limited RAM (512MB)
+MemoryLimit=400M
+CPUQuota=80%
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=auto-poster-bot
+
+[Install]
+WantedBy=multi-user.target
+
