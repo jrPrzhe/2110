@@ -165,3 +165,4 @@ echo "- Swap: $(free -h | grep Swap | awk '{print $2}')"
 echo "- Disk: $(df -h / | tail -1 | awk '{print $4}') available"
 echo ""
 
+

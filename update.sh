@@ -92,3 +92,4 @@ echo "To view logs:"
 echo "sudo journalctl -u auto-poster-bot -f"
 echo ""
 
+

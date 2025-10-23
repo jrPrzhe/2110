@@ -32,24 +32,35 @@ class TelegramService:
             bool: True if successful, False otherwise
         """
         try:
+            import asyncio
             logger.info(f"Posting single photo to Telegram group: {photo_path}")
             
-            with open(photo_path, 'rb') as photo_file:
-                await self.bot.send_photo(
-                    chat_id=self.group_id,
-                    photo=photo_file,
-                    caption=caption,
-                    parse_mode='HTML'
-                )
+            async def send_photo_task():
+                with open(photo_path, 'rb') as photo_file:
+                    await self.bot.send_photo(
+                        chat_id=self.group_id,
+                        photo=photo_file,
+                        caption=caption,
+                        parse_mode='HTML',
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=60
+                    )
+            
+            # Add overall timeout of 3 minutes
+            await asyncio.wait_for(send_photo_task(), timeout=180)
             
             logger.info("Photo posted successfully to Telegram group")
             return True
             
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout posting photo to Telegram (3 minutes exceeded)")
+            return False
         except TelegramError as e:
             logger.error(f"Telegram error posting photo: {e}")
             return False
         except Exception as e:
-            logger.error(f"Error posting photo to Telegram: {e}")
+            logger.error(f"Error posting photo to Telegram: {e}", exc_info=True)
             return False
     
     async def post_album(self, photo_paths: List[str], caption: str) -> bool:
@@ -64,6 +75,8 @@ class TelegramService:
             bool: True if successful, False otherwise
         """
         try:
+            import asyncio
+            
             if len(photo_paths) < 2:
                 logger.warning("Album requires at least 2 photos, posting as single photo instead")
                 return await self.post_photo(photo_paths[0], caption)
@@ -74,31 +87,41 @@ class TelegramService:
             
             logger.info(f"Posting album to Telegram group with {len(photo_paths)} photos")
             
-            # Prepare media group
-            media_group = []
-            for i, photo_path in enumerate(photo_paths):
-                with open(photo_path, 'rb') as photo_file:
-                    media = InputMediaPhoto(
-                        media=photo_file,
-                        caption=caption if i == 0 else None,  # Only first photo gets caption
-                        parse_mode='HTML'
-                    )
-                    media_group.append(media)
+            async def send_album_task():
+                # Prepare media group
+                media_group = []
+                for i, photo_path in enumerate(photo_paths):
+                    with open(photo_path, 'rb') as photo_file:
+                        media = InputMediaPhoto(
+                            media=photo_file,
+                            caption=caption if i == 0 else None,  # Only first photo gets caption
+                            parse_mode='HTML'
+                        )
+                        media_group.append(media)
+                
+                # Send media group
+                await self.bot.send_media_group(
+                    chat_id=self.group_id,
+                    media=media_group,
+                    read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=60
+                )
             
-            # Send media group
-            await self.bot.send_media_group(
-                chat_id=self.group_id,
-                media=media_group
-            )
+            # Add overall timeout of 3 minutes
+            await asyncio.wait_for(send_album_task(), timeout=180)
             
             logger.info("Album posted successfully to Telegram group")
             return True
             
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout posting album to Telegram (3 minutes exceeded)")
+            return False
         except TelegramError as e:
             logger.error(f"Telegram error posting album: {e}")
             return False
         except Exception as e:
-            logger.error(f"Error posting album to Telegram: {e}")
+            logger.error(f"Error posting album to Telegram: {e}", exc_info=True)
             return False
     
     async def post_to_telegram(self, photo_paths: List[str], caption: str) -> bool:
@@ -220,6 +243,7 @@ class TelegramService:
             bool: True if successful, False otherwise
         """
         try:
+            import asyncio
             logger.info(f"Posting video to Telegram group: {video_path}")
             
             # Check file size
@@ -227,26 +251,39 @@ class TelegramService:
             file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
             logger.info(f"Video file size: {file_size_mb:.2f} MB")
             
-            with open(video_path, 'rb') as video_file:
-                await self.bot.send_video(
-                    chat_id=self.group_id,
-                    video=video_file,
-                    caption=caption,
-                    parse_mode='HTML',
-                    supports_streaming=True,
-                    read_timeout=300,  # 5 минут на чтение
-                    write_timeout=300,  # 5 минут на отправку
-                    connect_timeout=60  # 1 минута на подключение
-                )
+            # Telegram Bot API limit is 50 MB for videos
+            if file_size_mb > 50:
+                logger.error(f"Video too large for Telegram: {file_size_mb:.2f} MB > 50 MB")
+                return False
+            
+            async def send_video_task():
+                with open(video_path, 'rb') as video_file:
+                    logger.info("Starting video upload to Telegram...")
+                    await self.bot.send_video(
+                        chat_id=self.group_id,
+                        video=video_file,
+                        caption=caption,
+                        parse_mode='HTML',
+                        supports_streaming=True,
+                        read_timeout=180,  # 3 минуты на чтение
+                        write_timeout=180,  # 3 минуты на отправку
+                        connect_timeout=60  # 1 минута на подключение
+                    )
+            
+            # Add overall timeout of 6 minutes
+            await asyncio.wait_for(send_video_task(), timeout=360)
             
             logger.info("Video posted successfully to Telegram group")
             return True
             
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout posting video to Telegram (6 minutes exceeded)")
+            return False
         except TelegramError as e:
             logger.error(f"Telegram error posting video: {e}")
             return False
         except Exception as e:
-            logger.error(f"Error posting video to Telegram: {e}")
+            logger.error(f"Error posting video to Telegram: {e}", exc_info=True)
             return False
     
     async def test_connection(self) -> bool:

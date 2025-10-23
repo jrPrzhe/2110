@@ -58,8 +58,19 @@ class AutoPosterBot:
         self.application.add_handler(CommandHandler("single", self.admin_handler.handle_mode_single))
         self.application.add_handler(CommandHandler("multi", self.admin_handler.handle_mode_multi))
         
+        # Queue management commands
+        self.application.add_handler(CommandHandler("add_link", self.admin_handler.handle_add_link))
+        self.application.add_handler(CommandHandler("queue", self.admin_handler.handle_view_queue))
+        
         # Message handlers
         self.application.add_handler(MessageHandler(filters.PHOTO, self.admin_handler.handle_photo))
+        self.application.add_handler(MessageHandler(filters.VIDEO, self.admin_handler.handle_video))
+        
+        # Queue management button handlers
+        self.application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^➕ Добавить ссылку$"), self.admin_handler.handle_add_link))
+        self.application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^📋 Очередь постов$"), self.admin_handler.handle_view_queue))
+        self.application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^🗑️ Очистить опубликованные$"), self.admin_handler.handle_clear_published))
+        self.application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^❌ Очистить все$"), self.admin_handler.handle_clear_all_queue))
         
         # New business process handlers
         self.application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^🚀 Начать публикацию$"), self.admin_handler.handle_start_publication))
@@ -110,6 +121,13 @@ class AutoPosterBot:
             logger.error(f"Configuration error: {e}")
             raise
         
+        # Start scheduler service
+        try:
+            await self.admin_handler.scheduler_service.start()
+            logger.info("Scheduler service started successfully")
+        except Exception as e:
+            logger.error(f"Failed to start scheduler: {e}")
+        
         # Test Instagram connection
         try:
             if self.admin_handler.instagram_service.login():
@@ -153,6 +171,13 @@ class AutoPosterBot:
     async def shutdown(self, application: Application):
         """Cleanup on shutdown."""
         logger.info("Shutting down Auto-Poster Bot...")
+        
+        # Stop scheduler service
+        try:
+            await self.admin_handler.scheduler_service.stop()
+            logger.info("Scheduler service stopped")
+        except Exception as e:
+            logger.error(f"Error stopping scheduler: {e}")
         
         # Logout from Instagram
         try:

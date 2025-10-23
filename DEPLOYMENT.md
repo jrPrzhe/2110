@@ -467,3 +467,4 @@ apt install --reinstall tesseract-ocr-rus tesseract-ocr-eng
 
 Для проверки напишите боту `/start` в Telegram.
 
+

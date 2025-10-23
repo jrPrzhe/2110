@@ -2,6 +2,19 @@
 
 A Telegram bot that automatically posts photos to Instagram, Telegram groups, and VK. The bot receives photos and captions from an admin via Telegram DMs and publishes them to selected platforms simultaneously.
 
+---
+
+## 📖 Документация
+
+**🚀 Новичок?** Начните здесь:
+- **[QUICK_GUIDE.md](QUICK_GUIDE.md)** - Бот за 1 минуту ⚡
+- **[WORKFLOW.md](WORKFLOW.md)** - Полный workflow 📋
+- **[CHEATSHEET.md](CHEATSHEET.md)** - Шпаргалка для печати 📝
+
+**📚 Вся документация:** [DOCS_INDEX.md](DOCS_INDEX.md) - навигация по всем документам
+
+---
+
 ## Features
 
 - 📸 **Photo Support**: Single photos or carousels/albums (2-10 photos)
@@ -149,18 +162,19 @@ For complete setup guide: [INSTALL_VK.md](INSTALL_VK.md)
 
 ## Workflow
 
-1. **Admin selects post type** → Single or multiple photos
-2. **Admin selects platform(s)** → Instagram, Telegram, VK, or all
-3. **Admin chooses article detection** → Optional product number recognition
-4. **Admin sends photos** → Bot saves them temporarily
-5. **Admin sends caption** → Bot processes photos (resize, format)
-6. **Bot shows preview** → Admin confirms or edits
-7. **Bot posts to selected platforms:**
-   - **Instagram** → Single photo or carousel
-   - **Telegram** → Photo or media group
-   - **VK** → Photo or album ✨ **NEW!**
-8. **Bot sends notification** → Success/error message to admin
-9. **Bot cleans up** → Removes temporary files
+**📖 Для понятного пошагового руководства смотрите:**
+- **[QUICK_GUIDE.md](QUICK_GUIDE.md)** - быстрый старт за 1 минуту ⚡
+- **[WORKFLOW.md](WORKFLOW.md)** - полный workflow со всеми сценариями 📋
+
+**Базовый процесс:**
+
+1. **Старт** → `/start` → "🚀 Начать публикацию"
+2. **Выбор платформы** → Instagram / Telegram / VK / Все
+3. **Выбор артикулов** → Да / Нет (опционально)
+4. **Отправка контента** → Фото / Видео / Ссылка на рилс
+5. **Подпись** → Текст поста
+6. **Публикация** → Сейчас / Запланировать / AI помощь
+7. **Готово** → Пост опубликован! ✅
 
 ## Image Processing
 
@@ -268,18 +282,31 @@ This project is for educational and personal use. Please respect Instagram's and
 
 ## Documentation
 
-- [README.md](README.md) - This file (overview and basic setup)
-- [START_HERE.md](START_HERE.md) - Quick orientation guide ✨ **NEW!**
-- [QUICK_START_VK.md](QUICK_START_VK.md) - 5-minute VK setup ✨ **NEW!**
-- [INSTALL_VK.md](INSTALL_VK.md) - Complete VK installation guide ✨ **NEW!**
-- [VK_SETUP.md](VK_SETUP.md) - Detailed VK configuration ✨ **NEW!**
-- [FAQ_VK.md](FAQ_VK.md) - Frequently Asked Questions about VK ✨ **NEW!**
-- [TROUBLESHOOTING_VK.md](TROUBLESHOOTING_VK.md) - Fix VK errors ✨ **NEW!**
-- [EXAMPLES.md](EXAMPLES.md) - Usage examples ✨ **NEW!**
-- [CHANGELOG_VK.md](CHANGELOG_VK.md) - Version history ✨ **NEW!**
-- [ARTICLE_DETECTION_IMPROVEMENTS.md](ARTICLE_DETECTION_IMPROVEMENTS.md) - Article detection features
-- [BUSINESS_PROCESS.md](BUSINESS_PROCESS.md) - Bot workflow and business logic
-- [AI_SETUP.md](AI_SETUP.md) - Google AI assistant setup
+### 🚀 Начните здесь:
+- **[QUICK_GUIDE.md](QUICK_GUIDE.md)** - Быстрый старт за 1 минуту ⚡
+- **[WORKFLOW.md](WORKFLOW.md)** - Полный workflow с примерами 📋
+- [README.md](README.md) - Обзор и установка
+
+### 📚 Подробные гайды:
+- [START_HERE.md](START_HERE.md) - Ориентация в проекте
+- [BUSINESS_PROCESS.md](BUSINESS_PROCESS.md) - Бизнес-логика бота
+- [EXAMPLES.md](EXAMPLES.md) - Примеры использования
+
+### 🔧 Настройка платформ:
+- [VK_SETUP.md](VK_SETUP.md) - Настройка VK
+- [INSTALL_VK.md](INSTALL_VK.md) - Установка VK
+- [QUICK_START_VK.md](QUICK_START_VK.md) - Быстрая настройка VK
+- [AI_SETUP.md](AI_SETUP.md) - Google AI помощник
+
+### 🔍 Функции и улучшения:
+- [ARTICLE_DETECTION_IMPROVEMENTS.md](ARTICLE_DETECTION_IMPROVEMENTS.md) - Поиск артикулов
+- [REELS_FEATURE.md](REELS_FEATURE.md) - Работа с рилсами
+- [SCHEDULER_GUIDE.md](SCHEDULER_GUIDE.md) - Планирование постов
+
+### ❓ Помощь:
+- [FAQ_VK.md](FAQ_VK.md) - Вопросы по VK
+- [TROUBLESHOOTING_VK.md](TROUBLESHOOTING_VK.md) - Решение проблем VK
+- [CHANGELOG_VK.md](CHANGELOG_VK.md) - История изменений
 
 ## What's New in VK Integration
 

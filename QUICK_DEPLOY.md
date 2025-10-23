@@ -67,3 +67,4 @@ chmod +x update.sh
 
 📖 Подробная инструкция: [DEPLOYMENT.md](DEPLOYMENT.md)
 
+

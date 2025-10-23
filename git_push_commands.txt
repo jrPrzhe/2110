@@ -1,0 +1,4 @@
+git remote add origin https://github.com/jrPrzhe/2110.git
+git push -u origin master
+
+

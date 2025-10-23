@@ -21,6 +21,9 @@ class InstagramService:
     def __init__(self):
         """Initialize the Instagram service."""
         self.client = Client()
+        # Set longer timeouts for better stability (especially for video downloads)
+        self.client.request_timeout = 30  # 30 seconds for general requests
+        self.client.private.request_timeout = 30  # 30 seconds for private API
         self.username = INSTAGRAM_USERNAME
         self.password = INSTAGRAM_PASSWORD
         # Use a stable session file to preserve exact session across restarts
@@ -57,6 +60,9 @@ class InstagramService:
             # Step 2: Recreate client from scratch
             logger.info("Recreating Instagram client...")
             self.client = Client()
+            # Set longer timeouts for better stability
+            self.client.request_timeout = 30
+            self.client.private.request_timeout = 30
             
             # Step 3: Try to login with fresh client
             logger.info("Attempting fresh login...")
@@ -240,6 +246,56 @@ class InstagramService:
                         return False
                 try:
                     return _attempt_album()
+                except Exception as e2:
+                    logger.error(f"Retry failed: {e2}")
+                    return False
+            return False
+
+    def post_video(self, video_path: str, caption: str) -> bool:
+        """
+        Post a video to Instagram as a regular post (not reels).
+
+        Args:
+            video_path: Path to the video file
+            caption: Caption for the post
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        def _attempt_video_upload() -> bool:
+            logger.info(f"Posting video to Instagram: {video_path}")
+            time.sleep(1.0)  # Small delay to avoid rate-limiting
+            self.client.video_upload(video_path, caption)
+            logger.info("Video posted successfully to Instagram")
+            return True
+
+        # Ensure logged in before attempting upload
+        if not self.is_logged_in():
+            logger.warning("Not logged in to Instagram, attempting login...")
+            if not self.login():
+                return False
+
+        try:
+            return _attempt_video_upload()
+        except Exception as e:
+            message = str(e)
+            logger.error(f"Error posting video to Instagram: {message}")
+            # Retry once on auth-related errors
+            if any(err in message for err in ("login_required", "LoginRequired", "user_has_logged_out")):
+                logger.warning("login_required during video upload, attempting session reload and retry once...")
+                # Reload session if exists
+                if os.path.exists(self.session_file):
+                    try:
+                        self.client.load_settings(self.session_file)
+                    except Exception as load_err:
+                        logger.warning(f"Failed to reload session: {load_err}")
+                # Re-login if still not valid
+                if not self.is_logged_in():
+                    if not self.login():
+                        return False
+                # Retry upload
+                try:
+                    return _attempt_video_upload()
                 except Exception as e2:
                     logger.error(f"Retry failed: {e2}")
                     return False
@@ -435,7 +491,7 @@ class InstagramService:
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             
-            response = requests.get(embed_url, headers=headers, timeout=None)
+            response = requests.get(embed_url, headers=headers, timeout=30)
             
             if response.status_code != 200:
                 logger.error(f"Failed to fetch embed page: {response.status_code}")
@@ -509,7 +565,7 @@ class InstagramService:
             embed_url = f"https://www.instagram.com/p/{shortcode}/embed/"
             
             logger.info(f"Fetching embed page: {embed_url}")
-            response = requests.get(embed_url, headers=headers, timeout=None)
+            response = requests.get(embed_url, headers=headers, timeout=30)
             
             if response.status_code != 200:
                 logger.error(f"Failed to fetch embed page: {response.status_code}")
@@ -520,14 +576,40 @@ class InstagramService:
                 logger.info("Download cancelled by user")
                 return None
             
-            # Extract video URL from embed page
-            video_url_match = re.search(r'"video_url":"([^"]+)"', response.text)
-            if not video_url_match:
-                logger.error("Could not find video URL in embed page")
-                return None
+            # Extract video URL from embed page - try multiple patterns
+            video_url = None
             
-            video_url = video_url_match.group(1).replace('\\u0026', '&')
-            logger.info(f"Found video URL: {video_url[:100]}...")
+            # Pattern 1: JSON format
+            video_url_match = re.search(r'"video_url":"([^"]+)"', response.text)
+            if video_url_match:
+                video_url = video_url_match.group(1).replace('\\u0026', '&')
+                logger.info(f"Found video URL (pattern 1): {video_url[:100]}...")
+            
+            # Pattern 2: Direct video source
+            if not video_url:
+                video_url_match = re.search(r'<video[^>]*src="([^"]+)"', response.text)
+                if video_url_match:
+                    video_url = video_url_match.group(1)
+                    logger.info(f"Found video URL (pattern 2): {video_url[:100]}...")
+            
+            # Pattern 3: og:video meta tag
+            if not video_url:
+                video_url_match = re.search(r'<meta property="og:video" content="([^"]+)"', response.text)
+                if video_url_match:
+                    video_url = video_url_match.group(1)
+                    logger.info(f"Found video URL (pattern 3): {video_url[:100]}...")
+            
+            # Pattern 4: Try to find any .mp4 URL
+            if not video_url:
+                video_url_match = re.search(r'(https://[^"\s]+\.mp4[^"\s]*)', response.text)
+                if video_url_match:
+                    video_url = video_url_match.group(1).replace('\\u0026', '&')
+                    logger.info(f"Found video URL (pattern 4): {video_url[:100]}...")
+            
+            if not video_url:
+                logger.error("Could not find video URL in embed page using any pattern")
+                logger.debug(f"First 500 chars of response: {response.text[:500]}")
+                return None
             
             # Download video
             if not os.path.exists(UPLOADS_DIR):
@@ -537,8 +619,8 @@ class InstagramService:
             video_path = os.path.join(UPLOADS_DIR, video_filename)
             
             logger.info(f"Downloading video to: {video_path}")
-            # NO TIMEOUT - download until complete or cancelled
-            video_response = requests.get(video_url, headers=headers, stream=True, timeout=None)
+            # Long timeout for connection, no timeout for read (download until complete or cancelled)
+            video_response = requests.get(video_url, headers=headers, stream=True, timeout=(30, None))
             
             if video_response.status_code != 200:
                 logger.error(f"Failed to download video: {video_response.status_code}")

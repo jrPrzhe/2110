@@ -312,3 +312,4 @@ MessageHandler(Regex("🔄 Reset Instagram"), handle_reset_instagram)
 **Версия:** 1.2.0  
 **Статус:** ✅ Готово
 
+

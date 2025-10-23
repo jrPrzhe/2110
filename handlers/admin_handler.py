@@ -18,6 +18,7 @@ from services.instagram_service import InstagramService
 from services.telegram_service import TelegramService
 from services.vk_service import VKService
 from services.ai_service import AIService
+from services.scheduler_service import SchedulerService, QueuedPost
 
 logger = logging.getLogger("admin")
 
@@ -31,6 +32,7 @@ class AdminHandler:
         self.telegram_service = TelegramService()
         self.vk_service = VKService()
         self.ai_service = AIService()
+        self.scheduler_service = SchedulerService()
         
         # User state management: {user_id: {'photos': [], 'waiting_for_caption': bool, 'post_mode': 'auto'|'single'|'multi'|'reels', 'target_platform': 'both'|'instagram'|'telegram'|'vk'|'all', 'step': 'start'|'type_selected'|'platform_selected'|'article_check_selection'|'photos_uploaded'|'caption_entered'|'preview_shown'|'scheduled'|'reels_url_input'|'reels_download', 'cancelled': bool, 'check_articles': bool, 'reels_url': str, 'reels_video_path': str}}
         self.user_states: Dict[int, Dict] = {}
@@ -38,21 +40,32 @@ class AdminHandler:
         self.pending_posts: Dict[int, Dict] = {}
         # Scheduled posts: {user_id: {'task': asyncio.Task, 'post_data': dict}}
         self.scheduled_posts: Dict[int, Dict] = {}
+        
+        # Set up scheduler publish callback
+        self.scheduler_service.set_publish_callback(self._publish_from_queue)
 
     def get_main_keyboard(self) -> ReplyKeyboardMarkup:
         """Return the main reply keyboard for quick actions."""
         keyboard = [
             [KeyboardButton("🚀 Начать публикацию")],
+            [KeyboardButton("📋 Очередь постов"), KeyboardButton("➕ Добавить ссылку")],
             [KeyboardButton("✅ Status"), KeyboardButton("❌ Cancel")],
             [KeyboardButton("ℹ️ Help")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     
     def get_type_selection_keyboard(self) -> ReplyKeyboardMarkup:
-        """Return keyboard for post type selection."""
+        """Return keyboard for post type selection (deprecated - now auto-detect)."""
         keyboard = [
             [KeyboardButton("📷 Одиночный пост"), KeyboardButton("📸 Массовый пост")],
             [KeyboardButton("📹 Публикация рилс")],
+            [KeyboardButton("❌ Отмена")],
+        ]
+        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    def get_content_input_keyboard(self) -> ReplyKeyboardMarkup:
+        """Return keyboard for content input step."""
+        keyboard = [
             [KeyboardButton("❌ Отмена")],
         ]
         return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -137,7 +150,7 @@ class AdminHandler:
     
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
-        Handle photo messages from admin.
+        Handle photo messages from admin with auto-detection.
         
         Args:
             update: Telegram update object
@@ -152,13 +165,16 @@ class AdminHandler:
             user_state = self.get_user_state(update.effective_user.id)
             
             # Check if we're in the right step, or allow direct photo upload
-            if user_state['step'] not in ['photos_upload', 'caption_entered']:
+            if user_state['step'] not in ['content_input', 'photos_upload', 'caption_entered']:
                 # Allow direct photo upload - set default values
-                user_state['post_mode'] = 'multi'  # Default to multi for batch upload
+                user_state['post_mode'] = 'auto'  # Auto-detect mode
                 user_state['target_platform'] = 'both'  # Default to both platforms
                 user_state['check_articles'] = True  # Default to article check
-                user_state['step'] = 'photos_upload'
-                await update.message.reply_text("📸 Прямая загрузка фото! Режим: массовый пост, платформы: Instagram + Telegram, поиск артикулов: включен")
+                user_state['step'] = 'content_input'
+                await update.message.reply_text("📸 Прямая загрузка фото! Режим: авто, платформы: Instagram + Telegram, поиск артикулов: включен")
+            
+            # Auto-detect: photos = photo post mode
+            user_state['post_mode'] = 'multi'  # Will handle single/multi automatically by count
             
             # Get the highest resolution photo
             photo = update.message.photo[-1]
@@ -174,14 +190,8 @@ class AdminHandler:
                 await update.message.reply_text(MESSAGES['invalid_photo'])
                 return
             
-            # Add photo to state
-            # If mode is 'single' and there is already a photo, replace it
-            if user_state.get('post_mode') == 'single' and user_state['photos']:
-                # Remove previous photo file
-                self.image_processor.cleanup_files(user_state['photos'])
-                user_state['photos'] = [photo_path]
-            else:
-                user_state['photos'].append(photo_path)
+            # Add photo to state (auto mode allows multiple photos)
+            user_state['photos'].append(photo_path)
             
             # Check photo count
             if len(user_state['photos']) > 10:
@@ -250,9 +260,61 @@ class AdminHandler:
             logger.error(f"Error handling photo: {e}")
             await update.message.reply_text(f"Error processing photo: {str(e)}")
     
+    async def handle_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Handle video messages from admin with auto-detection.
+        
+        Args:
+            update: Telegram update object
+            context: Bot context
+        """
+        if not self.is_admin(update.effective_user.id):
+            await update.message.reply_text(MESSAGES['unauthorized'])
+            return
+        
+        try:
+            # Get user state
+            user_state = self.get_user_state(update.effective_user.id)
+            
+            # Check if we're in the right step, or allow direct video upload
+            if user_state['step'] not in ['content_input', 'photos_upload']:
+                # Allow direct video upload - set default values
+                user_state['post_mode'] = 'video'  # Video mode
+                user_state['target_platform'] = 'all'  # Telegram + VK (Instagram doesn't support video upload via API)
+                user_state['check_articles'] = False  # No article check for videos
+                user_state['step'] = 'content_input'
+                await update.message.reply_text("📹 Прямая загрузка видео! Режим: видео, платформы: Telegram + VK")
+            
+            # Auto-detect: video = video post mode
+            user_state['post_mode'] = 'video'
+            
+            # Get video
+            video = update.message.video
+            file = await context.bot.get_file(video.file_id)
+            
+            # Download video
+            video_path = os.path.join(self.image_processor.uploads_dir, f"temp_{video.file_id}.mp4")
+            await file.download_to_drive(video_path)
+            
+            # Save video path
+            user_state['reels_video_path'] = video_path
+            user_state['step'] = 'reels_waiting_caption'
+            user_state['waiting_for_caption'] = True
+            
+            # Send confirmation
+            await update.message.reply_text(
+                "✅ <b>Видео загружено!</b>\n\n"
+                "📝 Теперь отправьте подпись к видео.",
+                parse_mode='HTML'
+            )
+            
+        except Exception as e:
+            logger.error(f"Error handling video: {e}")
+            await update.message.reply_text(f"❌ Ошибка обработки видео: {str(e)}")
+    
     async def handle_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
-        Handle text messages from admin (captions or reels URL).
+        Handle text messages from admin with auto-detection (captions, Instagram URLs, queue links).
         
         Args:
             update: Telegram update object
@@ -263,8 +325,44 @@ class AdminHandler:
             return
         
         user_state = self.get_user_state(update.effective_user.id)
+        text = update.message.text.strip()
         
-        # Check if we're waiting for reels URL
+        # Check if we're waiting for link for queue
+        if user_state.get('step') == 'waiting_for_link':
+            await self.handle_link_input(update, context)
+            return
+        
+        # AUTO-DETECT: Check if this is an Instagram URL when waiting for content
+        if user_state.get('step') == 'content_input':
+            if 'instagram.com' in text or 'instagr.am' in text:
+                # Auto-detect Instagram URL
+                if '/reel/' in text:
+                    # It's a reels URL
+                    logger.info(f"Auto-detected Instagram reels URL: {text}")
+                    user_state['post_mode'] = 'reels'
+                    user_state['step'] = 'reels_url_input'
+                    await self.handle_reels_url_input(update, context)
+                    return
+                elif '/p/' in text:
+                    # It's a post URL
+                    logger.info(f"Auto-detected Instagram post URL: {text}")
+                    await update.message.reply_text(
+                        "🔗 <b>Обнаружена ссылка на Instagram пост</b>\n\n"
+                        "⚠️ Данная функция пока не реализована.\n"
+                        "Пожалуйста, скачайте фото с поста вручную и отправьте их сюда.",
+                        parse_mode='HTML'
+                    )
+                    return
+                else:
+                    await update.message.reply_text(
+                        "❌ Неверный формат ссылки Instagram.\n\n"
+                        "Поддерживаются:\n"
+                        "• /reel/ - рилсы\n"
+                        "• /p/ - посты"
+                    )
+                    return
+        
+        # Check if we're waiting for reels URL (legacy path)
         if user_state['step'] == 'reels_url_input':
             await self.handle_reels_url_input(update, context)
             return
@@ -726,7 +824,11 @@ class AdminHandler:
                 logger.info(f"Enhanced caption with articles: {enhanced_caption}")
             else:
                 enhanced_caption = caption
-                logger.warning("No article numbers found, using original caption")
+                # Only warn if user expected articles (check_articles=True) but none were found
+                if user_state.get('check_articles', False):
+                    logger.warning("No article numbers found despite check_articles=True, using original caption")
+                else:
+                    logger.info("Using original caption without article numbers (check_articles=False)")
             
             # Check if cancelled before publishing
             if user_state.get('cancelled', False):
@@ -1125,40 +1227,70 @@ class AdminHandler:
             await update.message.reply_text(MESSAGES['unauthorized'])
             return
         
-        help_message = """🤖 <b>Помощь - Новый бизнес-процесс</b>
+        help_message = """🤖 <b>Помощь - Автопостер с умным определением</b>
 
-<b>Как использовать:</b>
+<b>📋 Автоматическая публикация:</b>
+1. ➕ Нажмите "Добавить ссылку"
+2. 📎 Отправьте ссылку на пост/рилс из Instagram
+3. ✅ Пост добавится в очередь
+4. ⏰ Будет опубликован автоматически в расписанное время
+
+<b>🚀 Ручная публикация (УПРОЩЁННАЯ!):</b>
 1. 🚀 Нажмите "Начать публикацию"
-2. 📷 Выберите тип поста (одиночный/массовый)
-3. 📱 Выберите платформу (Instagram/Telegram/Обе)
-4. 📸 Отправьте фото (1–10)
+2. 📱 Выберите платформу (Instagram/Telegram/VK/Все)
+3. 🔍 Выберите поиск артикулов (Да/Нет)
+4. 📤 Отправьте ЛЮБОЙ контент:
+   • 📷 Фото (одно или несколько)
+   • 📹 Видео файл
+   • 🔗 Ссылку на Instagram рилс
 5. 📝 Отправьте подпись к посту
-6. 🤖 Используйте "Помощь ИИ" для улучшения описания
-7. ⏰ Выберите время публикации (сейчас/запланировать)
+6. 🤖 Используйте "Помощь ИИ" для улучшения
+7. ⏰ Выберите время (сейчас/запланировать)
 
-<b>Команды:</b>
+<b>✨ Автоопределение типа:</b>
+Бот сам определит что вы отправили:
+• Фото → пост с фотографиями
+• Видео → видео пост
+• Ссылка /reel/ → скачает рилс
+Больше не нужно выбирать тип!
+
+<b>⏰ Расписание публикаций:</b>
+Фиксированные часы: 8, 10, 12, 14, 16, 18, 20, 22
+Раз в 2 часа публикуется один пост из очереди
+
+<b>📋 Управление очередью:</b>
+/add_link — добавить ссылку
+/queue — посмотреть очередь
+📋 Очередь постов — просмотр
+🗑️ Очистить опубликованные
+❌ Очистить все
+
+<b>🛠️ Основные команды:</b>
 /start — запуск
 /help — помощь
 /status — статус бота
 /cancel — отмена
+/reset — сброс Instagram сессии
 
-<b>Планирование:</b>
+<b>📝 Планирование разовых постов:</b>
 • <code>HH:MM</code> - сегодня в указанное время
 • <code>DD.MM HH:MM</code> - в указанную дату и время
 • <code>+N</code> - через N минут
 
-<b>ИИ помощь:</b>
+<b>🤖 ИИ помощь:</b>
 • Улучшает описания постов
 • Добавляет эмодзи и хештеги
 • Адаптирует стиль под платформу
 • Требует настройки GOOGLE_API_KEY
 
-<b>Примечания:</b>
-• Фото автоматически приводятся к 1080×1080 или 1080×1350
-• 1 фото = одиночный пост, 2–10 фото = карусель/альбом
+<b>📌 Примечания:</b>
+• Автоопределение типа контента
+• Очередь сохраняется при перезапуске
+• Фото автоматически обрабатываются
+• Поддержка фото, видео и рилсов
 • Доступ только у администратора
-• Временные файлы очищаются автоматически
-• Запланированные посты можно отменить командой /cancel"""
+
+📖 Подробнее: см. SCHEDULER_GUIDE.md"""
         
         await update.message.reply_text(help_message, parse_mode='HTML', reply_markup=self.get_main_keyboard())
 
@@ -1234,7 +1366,7 @@ class AdminHandler:
     
     async def handle_start_publication(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
-        Handle start publication process.
+        Handle start publication process with auto-detection.
         
         Args:
             update: Telegram update object
@@ -1247,18 +1379,28 @@ class AdminHandler:
         # Clear any existing state
         self.clear_user_state(update.effective_user.id)
         
-        # Start the business process
+        # Start the business process - go straight to platform selection
         user_state = self.get_user_state(update.effective_user.id)
-        user_state['step'] = 'type_selection'
+        user_state['step'] = 'platform_selection'
+        user_state['post_mode'] = 'auto'  # Auto-detect mode
         
         message = """🚀 <b>Начинаем процесс публикации</b>
 
-<b>Шаг 1:</b> Выберите тип загрузки:
+<b>Шаг 1:</b> Выберите платформу для публикации:
 
-📷 <b>Одиночный пост</b> - одно фото
-📸 <b>Массовый пост</b> - несколько фото (до 10)"""
+📷 <b>Instagram</b> - только Instagram
+💬 <b>Telegram</b> - только Telegram группа
+🔵 <b>VK</b> - только VK группа
+🔀 <b>Все платформы</b> - Instagram + Telegram + VK
+
+<i>💡 После выбора платформы отправьте:</i>
+• Фото (одно или несколько)
+• Видео
+• Ссылку на Instagram пост/рилс
+
+<i>Бот автоматически определит тип контента!</i>"""
         
-        await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_type_selection_keyboard())
+        await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_platform_selection_keyboard())
 
     async def handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """
@@ -1408,15 +1550,17 @@ class AdminHandler:
         user_state['target_platform'] = 'instagram'
         user_state['step'] = 'article_check_selection'
         
-        post_type = "одиночный" if user_state['post_mode'] == 'single' else "массовый"
-        message = f"""📷 <b>Instagram выбран</b>
+        message = """📷 <b>Instagram выбран</b>
 
-<b>Шаг 3:</b> Нужно ли искать артикулы на фотографиях?
+<b>Шаг 2:</b> Нужно ли искать артикулы на фотографиях?
 
 🔍 <b>Да, искать артикулы</b> - бот автоматически найдет номера товаров и добавит их в пост
-⏭️ <b>Нет, пропустить</b> - загрузить фото без поиска артикулов
+⏭️ <b>Нет, пропустить</b> - загрузить без поиска артикулов
 
-{'📷 Отправьте одно фото' if user_state['post_mode'] == 'single' else '📸 Отправьте фото (до 10 штук)'}"""
+<i>💡 На следующем шаге отправьте:</i>
+• Фото (одно или несколько до 10)
+• Видео файл
+• Ссылку на Instagram пост/рилс"""
         
         await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_article_check_keyboard())
 
@@ -1432,31 +1576,21 @@ class AdminHandler:
             return
         
         user_state['target_platform'] = 'telegram'
+        user_state['step'] = 'article_check_selection'
         
-        # Check if reels mode
-        if user_state['post_mode'] == 'reels':
-            user_state['step'] = 'reels_url_input'
-            message = """💬 <b>Telegram выбран</b>
+        message = """💬 <b>Telegram выбран</b>
 
-<b>Шаг 3:</b> Отправьте ссылку на рилс из Instagram
-
-Пример: https://www.instagram.com/reel/ABC123/"""
-            
-            await update.message.reply_text(message, parse_mode='HTML')
-        else:
-            user_state['step'] = 'article_check_selection'
-            
-            post_type = "одиночный" if user_state['post_mode'] == 'single' else "массовый"
-            message = f"""💬 <b>Telegram выбран</b>
-
-<b>Шаг 3:</b> Нужно ли искать артикулы на фотографиях?
+<b>Шаг 2:</b> Нужно ли искать артикулы на фотографиях?
 
 🔍 <b>Да, искать артикулы</b> - бот автоматически найдет номера товаров и добавит их в пост
-⏭️ <b>Нет, пропустить</b> - загрузить фото без поиска артикулов
+⏭️ <b>Нет, пропустить</b> - загрузить без поиска артикулов
 
-{'📷 Отправьте одно фото' if user_state['post_mode'] == 'single' else '📸 Отправьте фото (до 10 штук)'}"""
-            
-            await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_article_check_keyboard())
+<i>💡 На следующем шаге отправьте:</i>
+• Фото (одно или несколько до 10)
+• Видео файл
+• Ссылку на Instagram пост/рилс"""
+        
+        await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_article_check_keyboard())
 
     async def handle_platform_vk(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle VK platform selection."""
@@ -1470,31 +1604,21 @@ class AdminHandler:
             return
         
         user_state['target_platform'] = 'vk'
+        user_state['step'] = 'article_check_selection'
         
-        # Check if reels mode
-        if user_state['post_mode'] == 'reels':
-            user_state['step'] = 'reels_url_input'
-            message = """🔵 <b>VK выбран</b>
+        message = """🔵 <b>VK выбран</b>
 
-<b>Шаг 3:</b> Отправьте ссылку на рилс из Instagram
-
-Пример: https://www.instagram.com/reel/ABC123/"""
-            
-            await update.message.reply_text(message, parse_mode='HTML')
-        else:
-            user_state['step'] = 'article_check_selection'
-            
-            post_type = "одиночный" if user_state['post_mode'] == 'single' else "массовый"
-            message = f"""🔵 <b>VK выбран</b>
-
-<b>Шаг 3:</b> Нужно ли искать артикулы на фотографиях?
+<b>Шаг 2:</b> Нужно ли искать артикулы на фотографиях?
 
 🔍 <b>Да, искать артикулы</b> - бот автоматически найдет номера товаров и добавит их в пост
-⏭️ <b>Нет, пропустить</b> - загрузить фото без поиска артикулов
+⏭️ <b>Нет, пропустить</b> - загрузить без поиска артикулов
 
-{'📷 Отправьте одно фото' if user_state['post_mode'] == 'single' else '📸 Отправьте фото (до 10 штук)'}"""
-            
-            await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_article_check_keyboard())
+<i>💡 На следующем шаге отправьте:</i>
+• Фото (одно или несколько до 10)
+• Видео файл
+• Ссылку на Instagram пост/рилс"""
+        
+        await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_article_check_keyboard())
 
     async def handle_platform_both(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle all platforms selection."""
@@ -1508,31 +1632,21 @@ class AdminHandler:
             return
         
         user_state['target_platform'] = 'all'
+        user_state['step'] = 'article_check_selection'
         
-        # Check if reels mode
-        if user_state['post_mode'] == 'reels':
-            user_state['step'] = 'reels_url_input'
-            message = """🔀 <b>Все платформы выбраны (Telegram + VK)</b>
+        message = """🔀 <b>Все платформы выбраны</b>
 
-<b>Шаг 3:</b> Отправьте ссылку на рилс из Instagram
-
-Пример: https://www.instagram.com/reel/ABC123/"""
-            
-            await update.message.reply_text(message, parse_mode='HTML')
-        else:
-            user_state['step'] = 'article_check_selection'
-            
-            post_type = "одиночный" if user_state['post_mode'] == 'single' else "массовый"
-            message = f"""🔀 <b>Все платформы выбраны</b>
-
-<b>Шаг 3:</b> Нужно ли искать артикулы на фотографиях?
+<b>Шаг 2:</b> Нужно ли искать артикулы на фотографиях?
 
 🔍 <b>Да, искать артикулы</b> - бот автоматически найдет номера товаров и добавит их в пост
-⏭️ <b>Нет, пропустить</b> - загрузить фото без поиска артикулов
+⏭️ <b>Нет, пропустить</b> - загрузить без поиска артикулов
 
-{'📷 Отправьте одно фото' if user_state['post_mode'] == 'single' else '📸 Отправьте фото (до 10 штук)'}"""
-            
-            await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_article_check_keyboard())
+<i>💡 На следующем шаге отправьте:</i>
+• Фото (одно или несколько до 10)
+• Видео файл
+• Ссылку на Instagram пост/рилс"""
+        
+        await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_article_check_keyboard())
 
     async def handle_article_check_yes(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle article check selection - yes."""
@@ -1546,9 +1660,8 @@ class AdminHandler:
             return
         
         user_state['check_articles'] = True
-        user_state['step'] = 'photos_upload'
+        user_state['step'] = 'content_input'
         
-        post_type = "одиночный" if user_state['post_mode'] == 'single' else "массовый"
         platform_text = {
             'instagram': 'Instagram',
             'telegram': 'Telegram',
@@ -1559,14 +1672,19 @@ class AdminHandler:
         
         message = f"""🔍 <b>Поиск артикулов включен</b>
 
-<b>Шаг 4:</b> Отправьте фото для {post_type} поста
+<b>Шаг 3:</b> Отправьте контент для публикации
 
 📱 <b>Платформа:</b> {platform_text}
 🔍 <b>Поиск артикулов:</b> включен
 
-{'📷 Отправьте одно фото' if user_state['post_mode'] == 'single' else '📸 Отправьте фото (до 10 штук)'}"""
+📤 <b>Отправьте:</b>
+• 📷 Фото (одно или несколько до 10)
+• 📹 Видео файл
+• 🔗 Ссылку на Instagram пост/рилс
+
+<i>Бот автоматически определит тип контента!</i>"""
         
-        await update.message.reply_text(message, parse_mode='HTML')
+        await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_content_input_keyboard())
 
     async def handle_article_check_no(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle article check selection - no."""
@@ -1580,9 +1698,8 @@ class AdminHandler:
             return
         
         user_state['check_articles'] = False
-        user_state['step'] = 'photos_upload'
+        user_state['step'] = 'content_input'
         
-        post_type = "одиночный" if user_state['post_mode'] == 'single' else "массовый"
         platform_text = {
             'instagram': 'Instagram',
             'telegram': 'Telegram',
@@ -1593,14 +1710,19 @@ class AdminHandler:
         
         message = f"""⏭️ <b>Поиск артикулов пропущен</b>
 
-<b>Шаг 4:</b> Отправьте фото для {post_type} поста
+<b>Шаг 3:</b> Отправьте контент для публикации
 
 📱 <b>Платформа:</b> {platform_text}
 🔍 <b>Поиск артикулов:</b> отключен
 
-{'📷 Отправьте одно фото' if user_state['post_mode'] == 'single' else '📸 Отправьте фото (до 10 штук)'}"""
+📤 <b>Отправьте:</b>
+• 📷 Фото (одно или несколько до 10)
+• 📹 Видео файл
+• 🔗 Ссылку на Instagram пост/рилс
+
+<i>Бот автоматически определит тип контента!</i>"""
         
-        await update.message.reply_text(message, parse_mode='HTML')
+        await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_content_input_keyboard())
     
     async def handle_type_reels(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle reels type selection."""
@@ -1620,21 +1742,15 @@ class AdminHandler:
 
 <b>Шаг 2:</b> Выберите платформу для публикации:
 
+📷 <b>Instagram</b> - публикация как обычный видео-пост
 💬 <b>Telegram</b> - только Telegram группа  
 🔵 <b>VK</b> - только VK группа
-🔀 <b>Все платформы</b> - Telegram + VK
+🔀 <b>Все платформы</b> - Instagram + Telegram + VK
 
-<i>Примечание: Instagram не поддерживает публикацию рилсов через API</i>"""
+<i>Примечание: В Instagram видео будет опубликовано как обычный пост, не как reels</i>"""
         
-        # Create custom keyboard without Instagram option
-        keyboard = [
-            [KeyboardButton("💬 Telegram"), KeyboardButton("🔵 VK")],
-            [KeyboardButton("🔀 Все платформы")],
-            [KeyboardButton("❌ Отмена")],
-        ]
-        reels_platform_keyboard = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(message, parse_mode='HTML', reply_markup=reels_platform_keyboard)
+        # Use standard platform keyboard with Instagram option
+        await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_platform_selection_keyboard())
     
     async def handle_cancel_download(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle download cancellation via callback button."""
@@ -1655,11 +1771,13 @@ class AdminHandler:
     
     async def handle_reels_url_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle reels URL input with progress tracking and cancellation."""
-        if not self.is_admin(update.effective_user.id):
+        user_id = update.effective_user.id
+        
+        if not self.is_admin(user_id):
             await update.message.reply_text(MESSAGES['unauthorized'])
             return
         
-        user_state = self.get_user_state(update.effective_user.id)
+        user_state = self.get_user_state(user_id)
         
         # Check if we're waiting for URL
         if user_state['step'] != 'reels_url_input':
@@ -1815,20 +1933,47 @@ class AdminHandler:
         
         # Send video preview (in separate try-catch to preserve state if this fails)
         try:
-            with open(video_path, 'rb') as video:
-                await update.message.reply_video(
-                    video=video,
-                    caption="<b>✅ Предпросмотр рилса</b>\n\n📝 Теперь отправьте подпись к посту:",
-                    parse_mode='HTML',
-                    read_timeout=300,
-                    write_timeout=300,
-                    connect_timeout=60
+            # Check file size (Telegram has 50MB limit for videos)
+            file_size = os.path.getsize(video_path)
+            file_size_mb = file_size / (1024 * 1024)
+            logger.info(f"Video file size: {file_size_mb:.2f} MB")
+            
+            if file_size_mb > 50:
+                logger.warning(f"Video too large for Telegram preview: {file_size_mb:.2f} MB > 50 MB")
+                await update.message.reply_text(
+                    f"⚠️ <b>Видео слишком большое для предпросмотра</b> ({file_size_mb:.1f} MB)\n\n"
+                    "Но видео скачано успешно! 📝 Теперь отправьте подпись к посту:",
+                    parse_mode='HTML'
                 )
+            else:
+                logger.info(f"Sending video preview to user {user_id}")
+                # Use asyncio.wait_for to add overall timeout
+                async def send_video():
+                    with open(video_path, 'rb') as video:
+                        await update.message.reply_video(
+                            video=video,
+                            caption="<b>✅ Предпросмотр рилса</b>\n\n📝 Теперь отправьте подпись к посту:",
+                            parse_mode='HTML',
+                            read_timeout=180,
+                            write_timeout=180,
+                            connect_timeout=60
+                        )
+                
+                # Set overall timeout to 5 minutes
+                await asyncio.wait_for(send_video(), timeout=300)
+                logger.info(f"Video preview sent successfully to user {user_id}")
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout sending video preview (5 minutes exceeded)")
+            await update.message.reply_text(
+                "⚠️ <b>Превышен лимит времени отправки предпросмотра</b>\n\n"
+                "Но видео скачано успешно! 📝 Теперь отправьте подпись к посту:",
+                parse_mode='HTML'
+            )
         except Exception as e:
-            logger.error(f"Error sending video preview: {e}")
+            logger.error(f"Error sending video preview: {e}", exc_info=True)
             # Video is downloaded, state is set, just notify user without preview
             await update.message.reply_text(
-                "⚠️ <b>Не удалось отправить предпросмотр</b> (видео слишком большое)\n\n"
+                "⚠️ <b>Не удалось отправить предпросмотр</b>\n\n"
                 "Но видео скачано успешно! 📝 Теперь отправьте подпись к посту:",
                 parse_mode='HTML'
             )
@@ -1856,27 +2001,51 @@ class AdminHandler:
                 return
             
             # Publish to selected platforms
+            instagram_success = False
             telegram_success = False
             vk_success = False
+            
+            if user_state['target_platform'] in ['instagram', 'both', 'all']:
+                # Check if cancelled before Instagram publishing
+                if user_state.get('cancelled', False):
+                    await processing_msg.edit_text("❌ Операция отменена.")
+                    return
+                logger.info("Publishing to Instagram...")
+                # Instagram post_video is synchronous, run in executor
+                import asyncio
+                loop = asyncio.get_event_loop()
+                instagram_success = await loop.run_in_executor(
+                    None,
+                    self.instagram_service.post_video,
+                    video_path,
+                    caption
+                )
+                logger.info(f"Instagram publishing result: {instagram_success}")
             
             if user_state['target_platform'] in ['telegram', 'both', 'all']:
                 # Check if cancelled before Telegram publishing
                 if user_state.get('cancelled', False):
                     await processing_msg.edit_text("❌ Операция отменена.")
                     return
+                logger.info("Publishing to Telegram...")
                 telegram_success = await self.telegram_service.post_video(video_path, caption)
+                logger.info(f"Telegram publishing result: {telegram_success}")
             
             if user_state['target_platform'] in ['vk', 'all']:
                 # Check if cancelled before VK publishing
                 if user_state.get('cancelled', False):
                     await processing_msg.edit_text("❌ Операция отменена.")
                     return
+                logger.info("Publishing to VK...")
                 vk_success = await self.vk_service.post_video(video_path, caption)
+                logger.info(f"VK publishing result: {vk_success}")
             
             # Send results
             if immediate:
                 # Build success message based on which platforms succeeded
                 success_platforms = []
+                if instagram_success:
+                    success_platforms.append('Instagram')
                 if telegram_success:
                     success_platforms.append('Telegram')
                 if vk_success:
@@ -1891,6 +2060,8 @@ class AdminHandler:
             else:
                 # Scheduled post results
                 success_platforms = []
+                if instagram_success:
+                    success_platforms.append('Instagram')
                 if telegram_success:
                     success_platforms.append('Telegram')
                 if vk_success:
@@ -1916,3 +2087,296 @@ class AdminHandler:
             logger.error(f"Error processing and publishing reels: {e}")
             await update.message.reply_text(f"❌ Ошибка публикации рилса: {e}")
             self.clear_user_state(update.effective_user.id)
+    
+    async def handle_add_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Handle adding a link to the queue.
+        
+        Args:
+            update: Telegram update object
+            context: Bot context
+        """
+        if not self.is_admin(update.effective_user.id):
+            await update.message.reply_text(MESSAGES['unauthorized'])
+            return
+        
+        user_state = self.get_user_state(update.effective_user.id)
+        
+        # Set state to waiting for link
+        user_state['step'] = 'waiting_for_link'
+        
+        message = """➕ <b>Добавление ссылки в очередь</b>
+
+📝 Отправьте ссылку на пост или рилс из Instagram
+
+<b>Поддерживаемые форматы:</b>
+• https://www.instagram.com/p/ABC123/
+• https://www.instagram.com/reel/ABC123/
+
+Пост будет автоматически опубликован в следующее запланированное время."""
+        
+        await update.message.reply_text(message, parse_mode='HTML')
+    
+    async def handle_link_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Handle link input for queue.
+        
+        Args:
+            update: Telegram update object
+            context: Bot context
+        """
+        if not self.is_admin(update.effective_user.id):
+            await update.message.reply_text(MESSAGES['unauthorized'])
+            return
+        
+        user_state = self.get_user_state(update.effective_user.id)
+        
+        # Check if we're waiting for link
+        if user_state.get('step') != 'waiting_for_link':
+            return
+        
+        url = update.message.text.strip()
+        
+        # Validate URL
+        if not ('instagram.com' in url or 'instagr.am' in url):
+            await update.message.reply_text("❌ Неверная ссылка! Отправьте корректную ссылку на пост/рилс из Instagram.")
+            return
+        
+        # Add to queue
+        try:
+            post = self.scheduler_service.add_to_queue(url, platform='all')
+            
+            # Get schedule info
+            schedule_info = self.scheduler_service.get_schedule_info()
+            
+            message = f"""✅ <b>Ссылка добавлена в очередь!</b>
+
+📎 <b>URL:</b> {url[:50]}...
+🆔 <b>ID:</b> {post.id}
+📅 <b>Добавлено:</b> {datetime.fromisoformat(post.added_at).strftime('%d.%m.%Y %H:%M')}
+
+{schedule_info}"""
+            
+            await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_main_keyboard())
+            
+            # Clear state
+            user_state['step'] = 'start'
+            
+        except Exception as e:
+            logger.error(f"Error adding link to queue: {e}")
+            await update.message.reply_text(f"❌ Ошибка добавления ссылки: {e}")
+    
+    async def handle_view_queue(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Handle viewing the post queue.
+        
+        Args:
+            update: Telegram update object
+            context: Bot context
+        """
+        if not self.is_admin(update.effective_user.id):
+            await update.message.reply_text(MESSAGES['unauthorized'])
+            return
+        
+        try:
+            # Get all posts from queue
+            all_posts = self.scheduler_service.get_queue()
+            pending_posts = self.scheduler_service.get_pending_posts()
+            
+            if not all_posts:
+                message = """📋 <b>Очередь постов пуста</b>
+
+Используйте кнопку "➕ Добавить ссылку" для добавления постов в очередь."""
+                await update.message.reply_text(message, parse_mode='HTML', reply_markup=self.get_main_keyboard())
+                return
+            
+            # Get schedule info
+            schedule_info = self.scheduler_service.get_schedule_info()
+            
+            # Build message with queue details
+            message = f"""📋 <b>Очередь постов</b>
+
+{schedule_info}
+
+━━━━━━━━━━━━━━━━
+
+<b>Посты в очереди:</b>
+
+"""
+            
+            # Group posts by status
+            statuses = {
+                'pending': '⏳ В ожидании',
+                'processing': '🔄 Обрабатывается',
+                'published': '✅ Опубликован',
+                'failed': '❌ Ошибка'
+            }
+            
+            for status, status_text in statuses.items():
+                posts_with_status = [p for p in all_posts if p.status == status]
+                if posts_with_status:
+                    message += f"\n<b>{status_text}:</b> {len(posts_with_status)}\n"
+                    for post in posts_with_status[:5]:  # Show max 5 per status
+                        url_short = post.url[:40] + '...' if len(post.url) > 40 else post.url
+                        added = datetime.fromisoformat(post.added_at).strftime('%d.%m %H:%M')
+                        message += f"  • {url_short}\n    ID: {post.id} | {added}\n"
+                    
+                    if len(posts_with_status) > 5:
+                        message += f"  ... и ещё {len(posts_with_status) - 5}\n"
+            
+            # Add management buttons
+            keyboard = [
+                [KeyboardButton("🗑️ Очистить опубликованные"), KeyboardButton("❌ Очистить все")],
+                [KeyboardButton("🚀 Начать публикацию"), KeyboardButton("➕ Добавить ссылку")],
+                [KeyboardButton("✅ Status"), KeyboardButton("ℹ️ Help")],
+            ]
+            queue_keyboard = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            await update.message.reply_text(message, parse_mode='HTML', reply_markup=queue_keyboard)
+            
+        except Exception as e:
+            logger.error(f"Error viewing queue: {e}")
+            await update.message.reply_text(f"❌ Ошибка просмотра очереди: {e}")
+    
+    async def handle_clear_published(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Clear published posts from queue."""
+        if not self.is_admin(update.effective_user.id):
+            await update.message.reply_text(MESSAGES['unauthorized'])
+            return
+        
+        try:
+            published_count = len(self.scheduler_service.get_queue(status='published'))
+            self.scheduler_service.clear_queue(status='published')
+            
+            message = f"✅ Очищено опубликованных постов: {published_count}"
+            await update.message.reply_text(message, reply_markup=self.get_main_keyboard())
+            
+        except Exception as e:
+            logger.error(f"Error clearing published posts: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+    
+    async def handle_clear_all_queue(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Clear entire queue."""
+        if not self.is_admin(update.effective_user.id):
+            await update.message.reply_text(MESSAGES['unauthorized'])
+            return
+        
+        try:
+            total_count = len(self.scheduler_service.get_queue())
+            self.scheduler_service.clear_queue()
+            
+            message = f"✅ Очередь полностью очищена. Удалено постов: {total_count}"
+            await update.message.reply_text(message, reply_markup=self.get_main_keyboard())
+            
+        except Exception as e:
+            logger.error(f"Error clearing queue: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+    
+    async def _publish_from_queue(self, post: QueuedPost) -> bool:
+        """
+        Publish a post from the queue.
+        
+        Args:
+            post: The queued post to publish
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            logger.info(f"Publishing from queue: {post.id} - {post.url}")
+            
+            # Detect if it's a reels or regular post
+            is_reels = '/reel/' in post.url
+            
+            if is_reels:
+                # Download and publish reels
+                logger.info("Detected reels URL, downloading...")
+                video_path = self.instagram_service.download_reels(post.url)
+                
+                if not video_path:
+                    logger.error("Failed to download reels")
+                    return False
+                
+                # Get caption from reels
+                caption = self.instagram_service.get_reels_caption(post.url)
+                if not caption:
+                    caption = "📹 Новый рилс"
+                
+                # Publish to platforms
+                success = False
+                if post.platform in ['instagram', 'all']:
+                    success = self.instagram_service.post_video(video_path, caption) or success
+                
+                if post.platform in ['telegram', 'all']:
+                    success = await self.telegram_service.post_video(video_path, caption) or success
+                
+                if post.platform in ['vk', 'all']:
+                    success = await self.vk_service.post_video(video_path, caption) or success
+                
+                # Cleanup
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+                
+                return success
+            else:
+                # Regular post - download photos and publish
+                logger.info("Detected regular post URL, downloading photos...")
+                
+                # Try to download post media
+                try:
+                    if not self.instagram_service.is_logged_in():
+                        if not self.instagram_service.login():
+                            logger.error("Failed to login to Instagram")
+                            return False
+                    
+                    media_pk = self.instagram_service.client.media_pk_from_url(post.url)
+                    media_info = self.instagram_service.client.media_info(media_pk)
+                    
+                    # Download photos
+                    from config import UPLOADS_DIR
+                    photo_paths = []
+                    
+                    if media_info.media_type == 1:  # Single photo
+                        photo_path = self.instagram_service.client.photo_download(media_pk, folder=UPLOADS_DIR)
+                        photo_paths = [str(photo_path)]
+                    elif media_info.media_type == 8:  # Album
+                        album_path = self.instagram_service.client.album_download(media_pk, folder=UPLOADS_DIR)
+                        # album_download returns a list of paths
+                        photo_paths = [str(p) for p in album_path] if isinstance(album_path, list) else [str(album_path)]
+                    
+                    if not photo_paths:
+                        logger.error("No photos downloaded")
+                        return False
+                    
+                    # Get caption
+                    caption = media_info.caption_text if media_info.caption_text else "📸 Новый пост"
+                    
+                    # Process photos
+                    processed_photos = self.image_processor.process_photos(photo_paths)
+                    target_size = self.image_processor.determine_image_format(processed_photos)
+                    final_photos = [self.image_processor.resize_image(p, target_size) for p in processed_photos]
+                    
+                    # Publish to platforms
+                    success = False
+                    if post.platform in ['instagram', 'all']:
+                        success = self.instagram_service.post_to_instagram(final_photos, caption) or success
+                    
+                    if post.platform in ['telegram', 'all']:
+                        success = await self.telegram_service.post_to_telegram(final_photos, caption) or success
+                    
+                    if post.platform in ['vk', 'all']:
+                        success = await self.vk_service.post_to_vk(final_photos, caption) or success
+                    
+                    # Cleanup
+                    self.image_processor.cleanup_files(photo_paths)
+                    self.image_processor.cleanup_files(final_photos)
+                    
+                    return success
+                    
+                except Exception as e:
+                    logger.error(f"Error downloading/publishing post: {e}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error in _publish_from_queue: {e}")
+            return False
